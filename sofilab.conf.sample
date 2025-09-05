@@ -1,0 +1,53 @@
+# sofilab.conf.sample - SSH connection configuration template
+# Copy this file to sofilab.conf and customize with your server details
+
+# SERVER DEFINITIONS
+# Simple format: [alias] followed by connection details
+
+[pmx,pmx-home]
+host="192.168.1.100"
+user="root"
+password="your_password_here"
+port="22"
+keyfile="ssh/pmx_key"
+
+[router,rt]
+host="192.168.1.1"
+user="admin"
+password="your_router_password"
+port="22"
+keyfile="ssh/router_key"
+
+[server1,srv1]
+host="10.0.0.10"
+user="ubuntu"
+password=""
+port="22"
+keyfile="ssh/server1_key"
+
+[server2,srv2]
+host="example.com"
+user="deploy"
+password="optional_password"
+port="2222"
+keyfile="ssh/server2_key"
+
+# End of server definitions
+
+# Configuration format:
+# [alias1,alias2,alias3]
+# host="IP_ADDRESS or HOSTNAME"
+# user="USERNAME"
+# password="PASSWORD" (optional, leave empty for key-only auth)
+# port="SSH_PORT" (optional, defaults to 22)
+# keyfile="ssh/key_name" (optional, will auto-detect ssh/<alias>_key)
+
+# Authentication priority:
+# 1. SSH key (if keyfile specified or ssh/<alias>_key exists)
+# 2. Password (if specified)
+# 3. Direct SSH (relies on SSH agent or default keys)
+
+# Security notes:
+# - SSH key authentication is recommended over passwords
+# - Store SSH keys in the ssh/ directory
+# - Keep this configuration file secure and don't commit real passwords to git
