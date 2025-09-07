@@ -1,317 +1,444 @@
 #!/bin/bash
-# Comprehensive Proxmox Security Setup Script
-# Focuses on security configuration only
-# Safe to run multiple times (idempotent)
-# Prerequisites: Run pmx-update-server.sh first for system updates
+# Proxmox Security Setup - FIXED VERSION (no duplicate firewall rules)
+# - Properly handles Proxmox's symlinked authorized_keys
+# - Sets up SSH key auth correctly for Proxmox
+# - Hardens sshd
+# - Applies small sysctl hardening
+# - Configures Proxmox firewall rules (idempotent; de-duplicates)
+# - Readable function names, functions at top
 
-set -e
-set -u
+set -euo pipefail
 
-# Get configuration from sofilab.sh environment variables
-SSH_PORT="${SSH_PORT:-896}"
-ADMIN_USER="${ADMIN_USER:-root}"
+# ========================
+# Functions (top section)
+# ========================
 
-echo "=== Proxmox Security Configuration ==="
-echo "SSH Port: $SSH_PORT"
-echo "User: $ADMIN_USER"
-echo "Date: $(date)"
-echo ""
+log() { printf '%s\n' "$*"; }
 
-# ============================================================================
-# PART 1: SECURITY TOOLS INSTALLATION
-# ============================================================================
+require_root() {
+  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    echo "This script must be run as root." >&2
+    exit 1
+  fi
+}
 
-echo "Step 1: Installing essential security tools..."
+resolve_user_home() {
+  local user="$1"
+  local home
+  home="$(getent passwd "$user" | cut -d: -f6)"
+  [[ -z "${home:-}" ]] && home="/root"
+  printf '%s' "$home"
+}
 
-# Check if packages are already installed to avoid unnecessary operations
-PACKAGES_TO_INSTALL=""
-for pkg in fail2ban unattended-upgrades htop curl wget git; do
-    if ! dpkg -l | grep -q "^ii.*$pkg "; then
-        PACKAGES_TO_INSTALL="$PACKAGES_TO_INSTALL $pkg"
+ensure_dir_mode() {
+  local path="$1" mode="$2" owner="$3" group="$4"
+  mkdir -p "$path"
+  chmod "$mode" "$path"
+  chown "$owner:$group" "$path"
+}
+
+add_pubkey_to_proxmox() {
+  local pubfile="$1"
+  [[ ! -f "$pubfile" ]] && return 1
+  local proxmox_keys="/etc/pve/priv/authorized_keys"
+  if [[ -f "$proxmox_keys" ]]; then
+    log "Detected Proxmox system - using cluster authorized_keys"
+    touch "$proxmox_keys"
+    chmod 600 "$proxmox_keys"
+    if ! grep -Fqx "$(cat "$pubfile")" "$proxmox_keys" 2>/dev/null; then
+      cat "$pubfile" >> "$proxmox_keys"
+      log "✓ SSH key added to Proxmox cluster authorized_keys"
+      return 0
+    else
+      log "✓ SSH key already present in Proxmox cluster authorized_keys"
+      return 2
     fi
-done
-
-if [[ -n "$PACKAGES_TO_INSTALL" ]]; then
-    echo "Installing packages:$PACKAGES_TO_INSTALL"
-    apt update -qq
-    apt install -y $PACKAGES_TO_INSTALL
-else
-    echo "All required packages are already installed"
-fi
-
-echo "Step 2: Configuring fail2ban for SSH protection..."
-
-# Configure fail2ban only if not already configured
-if [[ ! -f /etc/fail2ban/jail.local ]] || ! grep -q "port = $SSH_PORT" /etc/fail2ban/jail.local 2>/dev/null; then
-    echo "Setting up fail2ban configuration..."
-    cat > /etc/fail2ban/jail.local << EOF
-[DEFAULT]
-bantime = 3600
-findtime = 600
-maxretry = 3
-
-[sshd]
-enabled = true
-port = $SSH_PORT
-filter = sshd
-logpath = /var/log/auth.log
-maxretry = 3
-EOF
-
-    if ! systemctl is-enabled fail2ban >/dev/null 2>&1; then
-        systemctl enable fail2ban
+  else
+    log "Standard system detected - using regular authorized_keys"
+    local auth_keys="/root/.ssh/authorized_keys"
+    touch "$auth_keys"
+    chmod 600 "$auth_keys"
+    if ! grep -Fqx "$(cat "$pubfile")" "$auth_keys" 2>/dev/null; then
+      cat "$pubfile" >> "$auth_keys"
+      return 0
     fi
-    systemctl restart fail2ban
-    echo "Fail2ban configured and restarted"
-else
-    echo "Fail2ban already configured for port $SSH_PORT"
-fi
+    return 2
+  fi
+}
 
-echo "Step 3: Configuring automatic security updates..."
+backup_sshd_config_once_per_day() {
+  local today
+  today="$(date +%Y%m%d)"
+  if ! ls /etc/ssh/sshd_config.backup."$today"_* >/dev/null 2>&1; then
+    cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.backup.${today}_$(date +%H%M%S)"
+  fi
+}
 
-# Configure unattended upgrades only if not already configured
-if [[ ! -f /etc/apt/apt.conf.d/50unattended-upgrades ]] || ! grep -q "distro_id" /etc/apt/apt.conf.d/50unattended-upgrades 2>/dev/null; then
-    echo "Setting up automatic security updates..."
-    cat > /etc/apt/apt.conf.d/50unattended-upgrades << 'EOF'
-Unattended-Upgrade::Allowed-Origins {
-    "${distro_id}:${distro_codename}-security";
-    "origin=Debian,codename=${distro_codename},label=Debian-Security";
-};
-Unattended-Upgrade::AutoFixInterruptedDpkg "true";
-Unattended-Upgrade::MinimalSteps "true";
-Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
-Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
-Unattended-Upgrade::Remove-Unused-Dependencies "true";
-Unattended-Upgrade::Automatic-Reboot "false";
-EOF
+# --- NEW: safer, comment-preserving updater (no awk needed) ---
+set_sshd_option_safe() {
+  # $1=Key  $2=Value  [$3=path]
+  local key="$1" val="$2" file="${3:-/etc/ssh/sshd_config}"
 
-    cat > /etc/apt/apt.conf.d/20auto-upgrades << 'EOF'
-APT::Periodic::Update-Package-Lists "1";
-APT::Periodic::Unattended-Upgrade "1";
-EOF
+  # If exact active entry exists, nothing to do
+  if grep -Eq "^[[:space:]]*${key}[[:space:]]+${val}([[:space:]]|$)" "$file"; then
+    log "✓ ${key} already set to ${val}"
+    return 0
+  fi
 
-    if ! systemctl is-enabled unattended-upgrades >/dev/null 2>&1; then
-        systemctl enable unattended-upgrades
-    fi
-    echo "Automatic security updates configured"
-else
-    echo "Automatic security updates already configured"
-fi
+  # If an active (uncommented) entry exists with a different value → replace it
+  if grep -Eq "^[[:space:]]*${key}[[:space:]]+" "$file"; then
+    sed -i -E "s|^[[:space:]]*${key}[[:space:]]+.*|${key} ${val}|" "$file"
+    log "✓ ${key} updated to ${val}"
+    return 0
+  fi
 
-echo "Step 4: Applying system hardening..."
+  # If only commented entries exist → append a clean line (keep comments)
+  if grep -Eq "^[[:space:]]*#.*${key}" "$file"; then
+    echo "${key} ${val}" >> "$file"
+    log "✓ ${key} added (new line, comment preserved)"
+    return 0
+  fi
 
-# Disable unused network protocols (idempotent)
-echo "Hardening network protocols..."
-if [[ ! -f /etc/modprobe.d/blacklist-rare-protocols.conf ]]; then
-    cat > /etc/modprobe.d/blacklist-rare-protocols.conf << 'EOF'
-install dccp /bin/true
-install sctp /bin/true
-install rds /bin/true
-install tipc /bin/true
-EOF
-    echo "Network protocols blacklisted"
-else
-    echo "Network protocols already hardened"
-fi
+  # No entry at all → append
+  echo "${key} ${val}" >> "$file"
+  log "✓ ${key} added"
+}
 
-# Set kernel parameters for security (idempotent)
-echo "Configuring kernel security parameters..."
-if [[ ! -f /etc/sysctl.d/99-security.conf ]] || ! grep -q "net.ipv4.conf.all.rp_filter" /etc/sysctl.d/99-security.conf 2>/dev/null; then
-    cat > /etc/sysctl.d/99-security.conf << 'EOF'
+apply_sysctl_hardening() {
+  local conf="/etc/sysctl.d/99-security.conf"
+  if [[ ! -f "$conf" ]] || ! grep -q "net.ipv4.conf.all.rp_filter" "$conf" 2>/dev/null; then
+    cat >"$conf" <<'EOF'
 # IP Spoofing protection
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.conf.default.rp_filter = 1
-
 # Ignore ICMP redirects
 net.ipv4.conf.all.accept_redirects = 0
 net.ipv6.conf.all.accept_redirects = 0
-
 # Ignore send redirects
 net.ipv4.conf.all.send_redirects = 0
-
 # Disable source packet routing
 net.ipv4.conf.all.accept_source_route = 0
 net.ipv6.conf.all.accept_source_route = 0
-
-# Log Martians
+# Log martians
 net.ipv4.conf.all.log_martians = 1
-
-# Ignore ping requests
-net.ipv4.icmp_echo_ignore_all = 0
 EOF
-    sysctl -p /etc/sysctl.d/99-security.conf
-    echo "Kernel security parameters applied"
-else
-    echo "Kernel security parameters already configured"
-fi
+    sysctl -p "$conf" >/dev/null 2>&1 || true
+    log "✓ Kernel security parameters applied"
+  else
+    log "✓ Kernel security parameters already configured"
+  fi
+}
 
-# ============================================================================
-# PART 2: SSH SECURITY CONFIGURATION
-# ============================================================================
+# ---------- FIREWALL (simple, using native Proxmox tools) ----------
 
-echo ""
-echo "Step 5: SSH Security Configuration..."
+fw_enable_datacenter() {
+  # Enable datacenter firewall using pve-firewall command
+  if ! pve-firewall status 2>/dev/null | grep -q "Status: enabled"; then
+    pve-firewall start >/dev/null 2>&1 || true
+    log "✓ Proxmox datacenter firewall enabled"
+  else
+    log "✓ Proxmox datacenter firewall already enabled"
+  fi
+}
 
-# Backup original SSH config (only if not already backed up today)
-BACKUP_DATE=$(date +%Y%m%d)
-if [[ ! -f "/etc/ssh/sshd_config.backup.$BACKUP_DATE"* ]]; then
-    echo "Backing up SSH configuration..."
-    cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.backup.$(date +%Y%m%d_%H%M%S)"
-else
-    echo "SSH configuration already backed up today"
-fi
+fw_ensure_rule_exists() {
+  local dport="$1" comment="$2" action="${3:-ACCEPT}"
+  local fw_file="/etc/pve/firewall/cluster.fw"
+  
+  # Create firewall config if it doesn't exist
+  if [[ ! -f "$fw_file" ]]; then
+    cat > "$fw_file" <<EOF
+[OPTIONS]
+enable: 1
 
-# Create SSH directory
-echo "Setting up SSH directory..."
-mkdir -p /root/.ssh
-chmod 700 /root/.ssh
+[RULES]
+EOF
+    log "Created new datacenter firewall configuration"
+  fi
+  
+  # Check if rule already exists (any action for this port)
+  if grep -q "^IN.*tcp.*dport ${dport}" "$fw_file" 2>/dev/null; then
+    log "✓ Firewall rule exists for port ${dport}"
+    return 0
+  fi
+  
+  # Add the rule to the [RULES] section
+  if grep -q "^\[RULES\]" "$fw_file"; then
+    # Insert after [RULES] line
+    sed -i "/^\[RULES\]/a IN ${action} -p tcp -dport ${dport} -comment \"${comment}\"" "$fw_file"
+  else
+    # Add [RULES] section and the rule
+    echo "" >> "$fw_file"
+    echo "[RULES]" >> "$fw_file"
+    echo "IN ${action} -p tcp -dport ${dport} -comment \"${comment}\"" >> "$fw_file"
+  fi
+  
+  log "✓ Added firewall ${action} rule for port ${dport} (${comment})"
+}
 
-# Setup authorized_keys with SSH key from sofilab
-echo "Setting up SSH key authentication..."
-
-if [[ -f "/tmp/sofilab_pubkey" ]]; then
-    echo "Installing SSH public key from sofilab..."
-    cat /tmp/sofilab_pubkey > /root/.ssh/authorized_keys
-    chmod 600 /root/.ssh/authorized_keys
-    rm -f /tmp/sofilab_pubkey
-    echo "SSH public key installed successfully"
-elif [[ -f /root/.ssh/authorized_keys && -s /root/.ssh/authorized_keys ]]; then
-    echo "Using existing authorized_keys file"
-    chmod 600 /root/.ssh/authorized_keys
-else
-    echo "ERROR: No SSH public key available!"
-    echo "Make sure you run this script through sofilab.sh which will upload the key."
-    exit 1
-fi
-
-# Configure SSH daemon (idempotent modifications)
-echo "Configuring SSH daemon..."
-
-# Function to update SSH config setting
-update_ssh_config() {
-    local setting="$1"
-    local value="$2"
-    local config_file="/etc/ssh/sshd_config"
+fw_remove_port_rules() {
+  local dport="$1"
+  local fw_file="/etc/pve/firewall/cluster.fw"
+  local removed=0
+  
+  if [[ -f "$fw_file" ]]; then
+    # Count existing rules for this port
+    local count=$(grep -c "dport ${dport}" "$fw_file" 2>/dev/null || echo "0")
     
-    # Remove any existing setting (commented or uncommented)
-    sed -i "/^#*${setting}/d" "$config_file"
-    # Add the new setting
-    echo "${setting} ${value}" >> "$config_file"
-}
-
-# Apply SSH security settings
-update_ssh_config "Port" "$SSH_PORT"
-update_ssh_config "PasswordAuthentication" "no"
-update_ssh_config "PubkeyAuthentication" "yes"
-update_ssh_config "PermitRootLogin" "prohibit-password"
-update_ssh_config "PermitEmptyPasswords" "no"
-
-echo "SSH daemon configured with security settings"
-
-# ============================================================================
-# PART 3: PROXMOX FIREWALL CONFIGURATION
-# ============================================================================
-
-echo ""
-echo "Step 6: Configuring Proxmox firewall..."
-
-# Enable datacenter firewall if not already enabled
-if ! pvesh get /cluster/firewall/options 2>/dev/null | grep -q '"enable":1'; then
-    pvesh set /cluster/firewall/options --enable 1 2>/dev/null || true
-    echo "Proxmox datacenter firewall enabled"
-else
-    echo "Proxmox datacenter firewall already enabled"
-fi
-
-# Function to check if firewall rule exists
-rule_exists() {
-    local port="$1"
-    local comment="$2"
-    pvesh get /cluster/firewall/rules --output-format json 2>/dev/null | \
-    grep -q "\"dport\":\"$port\".*\"comment\":\"$comment\""
-}
-
-# Add rule for Proxmox Web UI (port 8006) - CRITICAL for web access
-if ! rule_exists "8006" "Proxmox-WebUI"; then
-    pvesh create /cluster/firewall/rules --type in --action ACCEPT --proto tcp --dport 8006 --comment "Proxmox-WebUI" --enable 1 2>/dev/null && \
-    echo "Added Proxmox WebUI firewall rule" || echo "Failed to add Proxmox WebUI rule"
-else
-    echo "Proxmox WebUI firewall rule already exists"
-fi
-
-# Add SSH rule for custom port
-if ! rule_exists "$SSH_PORT" "SSH-$SSH_PORT"; then
-    pvesh create /cluster/firewall/rules --type in --action ACCEPT --proto tcp --dport $SSH_PORT --comment "SSH-$SSH_PORT" --enable 1 2>/dev/null && \
-    echo "Added SSH firewall rule for port $SSH_PORT" || echo "Failed to add SSH rule"
-else
-    echo "SSH firewall rule for port $SSH_PORT already exists"
-fi
-
-# Remove default SSH rule on port 22 (if exists and different from our SSH_PORT)
-if [[ "$SSH_PORT" != "22" ]]; then
-    echo "Checking for default SSH rule on port 22..."
-    pvesh get /cluster/firewall/rules --output-format json 2>/dev/null | grep -o '"pos":[0-9]*' | grep -o '[0-9]*' | while read pos; do
-        rule_info=$(pvesh get /cluster/firewall/rules/$pos --output-format json 2>/dev/null || echo "")
-        if echo "$rule_info" | grep -q '"dport":"22"' && echo "$rule_info" | grep -q '"proto":"tcp"'; then
-            pvesh delete /cluster/firewall/rules/$pos 2>/dev/null && echo "Removed default SSH rule on port 22" || true
-            break
-        fi
-    done 2>/dev/null || true
-fi
-
-echo "Proxmox firewall status:"
-echo "- SSH port $SSH_PORT: CONFIGURED"
-echo "- Proxmox WebUI port 8006: CONFIGURED"
-
-# ============================================================================
-# PART 4: FINALIZATION AND TESTING
-# ============================================================================
-
-echo ""
-echo "Step 7: Testing and finalizing SSH configuration..."
-if sshd -t; then
-    echo "SSH configuration is valid"
-    if systemctl restart sshd; then
-        echo "SSH service restarted successfully"
-    else
-        echo "WARNING: SSH service restart failed, but configuration is valid"
+    if [[ "$count" -gt 0 ]]; then
+      # Remove all rules for this port
+      sed -i "/dport ${dport}/d" "$fw_file"
+      removed="$count"
+      log "✓ Removed ${removed} firewall rule(s) for port ${dport}"
     fi
-else
-    echo "ERROR: SSH configuration is invalid!"
-    echo "Restoring backup..."
+  fi
+  
+  echo "$removed"
+}
+
+fw_cleanup_duplicates() {
+  local fw_file="/etc/pve/firewall/cluster.fw"
+  
+  if [[ ! -f "$fw_file" ]]; then
+    return 0
+  fi
+  
+  log "Cleaning up duplicate firewall rules..."
+  
+  # Create a temporary file to store unique rules
+  local temp_file=$(mktemp)
+  local in_rules_section=false
+  local seen_ports=()
+  
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^\[RULES\] ]]; then
+      echo "$line" >> "$temp_file"
+      in_rules_section=true
+      continue
+    elif [[ "$line" =~ ^\[.*\] ]]; then
+      in_rules_section=false
+      echo "$line" >> "$temp_file"
+      continue
+    fi
+    
+    if [[ "$in_rules_section" == true ]] && [[ "$line" =~ dport[[:space:]]+([0-9]+) ]]; then
+      local port="${BASH_REMATCH[1]}"
+      
+      # Check if we've already seen this port
+      local already_seen=false
+      for seen_port in "${seen_ports[@]}"; do
+        if [[ "$seen_port" == "$port" ]]; then
+          already_seen=true
+          break
+        fi
+      done
+      
+      if [[ "$already_seen" == false ]]; then
+        echo "$line" >> "$temp_file"
+        seen_ports+=("$port")
+      else
+        log "  ✓ Removed duplicate rule for port $port"
+      fi
+    else
+      echo "$line" >> "$temp_file"
+    fi
+  done < "$fw_file"
+  
+  # Replace the original file with the cleaned version
+  mv "$temp_file" "$fw_file"
+}
+
+fw_restart_firewall() {
+  # Restart firewall to apply changes
+  pve-firewall restart >/dev/null 2>&1 || true
+  log "✓ Firewall rules reloaded"
+}
+
+test_and_restart_sshd_or_restore() {
+  if sshd -t 2>/dev/null; then
+    log "✓ SSH configuration is valid"
+    if systemctl restart sshd; then
+      log "✓ SSH service restarted successfully"
+    else
+      log "⚠ SSH service restart failed, but configuration is valid"
+    fi
+  else
+    echo "ERROR: sshd configuration invalid! Restoring last backup..." >&2
     if ls /etc/ssh/sshd_config.backup.* >/dev/null 2>&1; then
-        cp $(ls -t /etc/ssh/sshd_config.backup.* | head -1) /etc/ssh/sshd_config
-        systemctl restart sshd
-        echo "SSH configuration restored from backup"
+      cp "$(ls -t /etc/ssh/sshd_config.backup.* | head -1)" /etc/ssh/sshd_config
+      systemctl restart sshd || true
+      log "Restored sshd_config from backup."
     fi
     exit 1
+  fi
+}
+
+test_ssh_key_auth() {
+  local keyfile="$1" port="$2"
+  if [[ -n "$keyfile" && -f "$keyfile" ]]; then
+    if ssh -i "$keyfile" -p "$port" -o StrictHostKeyChecking=accept-new \
+           -o PasswordAuthentication=no -o ConnectTimeout=5 \
+           -o BatchMode=yes localhost "echo ok" >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+print_summary() {
+  echo
+  echo "=== Proxmox Security Configuration Complete ==="
+  echo "✓ SSH key authentication configured"
+  if [[ "$DISABLE_PASSWORD_AUTH" == "yes" ]]; then
+    echo "✓ Password authentication disabled"
+  else
+    echo "⚠ Password authentication ENABLED (no SSH keys found)"
+  fi
+  echo "✓ SSH listens on port: $SSH_LISTEN_PORT"
+  echo "✓ Basic system hardening applied"
+  echo "✓ Proxmox firewall configured:"
+  echo "  - SSH $SSH_LISTEN_PORT: ALLOWED"
+  echo "  - 8006 (WebUI): ALLOWED"
+  if [[ "$SSH_LISTEN_PORT" != "22" ]]; then
+    echo "  - 22: no ACCEPT rule; sshd not listening"
+  fi
+  echo
+  echo "Security Summary:"
+  echo "- SSH Port       : $SSH_LISTEN_PORT"
+  if [[ "$DISABLE_PASSWORD_AUTH" == "yes" ]]; then
+    echo "- Authentication : SSH keys only"
+  else
+    echo "- Authentication : Password"
+  fi
+  echo "- WebUI          : 8006 (allowed)"
+  echo "- Firewall scope : Datacenter"
+  echo
+  if [[ -f "/etc/pve/priv/authorized_keys" ]]; then
+    echo "Proxmox SSH Key Location:"
+    echo "- Cluster keys: /etc/pve/priv/authorized_keys"
+    echo "- Symlink:     /root/.ssh/authorized_keys"
+    echo
+  fi
+  if [[ "$KEY_WAS_ADDED" == "true" ]]; then
+    echo "Test SSH:"
+    echo "  ssh -i \"$SSH_PUBLIC_KEY_PATH_NO_EXT\" -p \"$SSH_LISTEN_PORT\" \"$ADMIN_USER\"@$(hostname -I | awk '{print $1}')"
+  else
+    echo "Add your key:"
+    echo "  ssh-copy-id -i /path/to/key.pub -p \"$SSH_LISTEN_PORT\" \"$ADMIN_USER\"@$(hostname -I | awk '{print $1}')"
+  fi
+}
+
+# ========================
+# Config / Inputs
+# ========================
+
+require_root
+SSH_LISTEN_PORT="${SSH_PORT:-896}"
+CURRENT_CONN_PORT="${ACTUAL_PORT:-$SSH_LISTEN_PORT}"
+ADMIN_USER="${ADMIN_USER:-root}"
+SSH_PUBLIC_KEY_PATH_NO_EXT="${SSH_KEY_PATH:-}"
+SSH_PUBLIC_KEY_CONTENT="${SSH_PUBLIC_KEY:-}"
+
+log "=== Proxmox Security Configuration ==="
+log "Configured SSH Port : $SSH_LISTEN_PORT"
+log "Current Conn Port   : $CURRENT_CONN_PORT"
+log "Target User         : $ADMIN_USER"
+log "Date                : $(date)"
+echo
+
+# ========================
+# PART 1: SSH KEY SETUP
+# ========================
+
+log "Step 1: Setting up SSH key authentication..."
+ADMIN_HOME="$(resolve_user_home "$ADMIN_USER")"
+SSH_DIR="${ADMIN_HOME}/.ssh"
+ensure_dir_mode "$SSH_DIR" 700 "$ADMIN_USER" "$ADMIN_USER"
+
+KEY_WAS_ADDED="false"; KEY_AUTH_WORKS="false"
+
+if [[ -f "/etc/pve/priv/authorized_keys" ]]; then
+  log "Detected Proxmox VE system"
+  [[ -L "$SSH_DIR/authorized_keys" ]] || ln -sf /etc/pve/priv/authorized_keys "$SSH_DIR/authorized_keys"
 fi
 
-echo ""
-echo "=== Proxmox Security Configuration Complete ==="
-echo ""
-echo "✓ Security tools installed and configured"
-echo "✓ Fail2ban protecting SSH on port $SSH_PORT"
-echo "✓ Automatic security updates enabled"
-echo "✓ System hardening applied"
-echo "✓ SSH configured with key-only authentication"
-echo "✓ SSH port changed to $SSH_PORT"
-echo "✓ Proxmox firewall configured"
-echo ""
-echo "IMPORTANT: Test your SSH connection now!"
-echo "Command: ssh -i ssh/pmx_key -p $SSH_PORT root@$(hostname -I | awk '{print $1}')"
-echo ""
-echo "If SSH connection fails, you can restore the backup:"
-echo "cp \$(ls -t /etc/ssh/sshd_config.backup.* | head -1) /etc/ssh/sshd_config && systemctl restart sshd"
-echo ""
-echo "Security Summary:"
-echo "- SSH Port: $SSH_PORT (password auth disabled)"
-echo "- Proxmox WebUI: port 8006 (accessible)"
-echo "- Fail2ban: protecting SSH"
-echo "- Auto-updates: enabled for security patches"
-echo "- Firewall: Proxmox built-in (configured)"
-echo ""
-echo "Note: Run pmx-update-server.sh first for system updates"
+if [[ -n "$SSH_PUBLIC_KEY_CONTENT" ]]; then
+  temp_pubkey="/tmp/sofilab_pubkey_$$.pub"
+  echo "$SSH_PUBLIC_KEY_CONTENT" > "$temp_pubkey"
+  if add_pubkey_to_proxmox "$temp_pubkey"; then KEY_WAS_ADDED="true"; fi
+  rm -f "$temp_pubkey"
+  log "✓ SSH key added (via content)"; KEY_AUTH_WORKS="true"
+elif [[ -n "$SSH_PUBLIC_KEY_PATH_NO_EXT" ]] && [[ -f "${SSH_PUBLIC_KEY_PATH_NO_EXT}.pub" ]]; then
+  if add_pubkey_to_proxmox "${SSH_PUBLIC_KEY_PATH_NO_EXT}.pub"; then KEY_WAS_ADDED="true"; fi
+  if test_ssh_key_auth "$SSH_PUBLIC_KEY_PATH_NO_EXT" "$CURRENT_CONN_PORT"; then
+    log "✓ SSH key authentication verified"; KEY_AUTH_WORKS="true"
+  else
+    log "⚠ SSH key added but auth test failed"
+  fi
+else
+  log "No SSH key provided (content/path)."
+fi
 
-# Explicit success exit
+if [[ -s "/etc/pve/priv/authorized_keys" ]] || [[ -s "$SSH_DIR/authorized_keys" ]]; then
+  log "✓ Authorized keys present"
+  DISABLE_PASSWORD_AUTH=$([[ "$KEY_AUTH_WORKS" == "true" ]] && echo "yes" || echo "no")
+else
+  log "WARNING: No SSH keys configured; keeping password auth"
+  DISABLE_PASSWORD_AUTH="no"
+fi
+
+# ==============================
+# PART 2: SSHD CONFIGURATION
+# ==============================
+
+echo; log "Step 2: Configuring sshd..."
+backup_sshd_config_once_per_day
+set_sshd_option_safe "Port" "$SSH_LISTEN_PORT"
+set_sshd_option_safe "PubkeyAuthentication" "yes"
+set_sshd_option_safe "PermitEmptyPasswords" "no"
+set_sshd_option_safe "PermitRootLogin" "prohibit-password"
+if [[ "$DISABLE_PASSWORD_AUTH" == "yes" ]]; then
+  set_sshd_option_safe "PasswordAuthentication" "no"; log "✓ Password auth disabled (keys verified)"
+else
+  set_sshd_option_safe "PasswordAuthentication" "yes"; log "⚠ Password auth kept (no verified keys)"
+fi
+
+# ==============================
+# PART 3: BASIC SYSCTL HARDEN
+# ==============================
+
+echo; log "Step 3: Applying basic system hardening..."; apply_sysctl_hardening
+
+# =======================================
+# PART 4: PROXMOX FIREWALL CONFIGURATION
+# =======================================
+
+echo; log "Step 4: Configuring Proxmox firewall (Datacenter scope)..."
+fw_enable_datacenter
+fw_cleanup_duplicates
+fw_ensure_rule_exists "8006" "Proxmox-WebUI"
+fw_ensure_rule_exists "$SSH_LISTEN_PORT" "SSH-Allowed"
+
+if [[ "$SSH_LISTEN_PORT" != "22" ]]; then
+  log "Removing any rules for port 22 (since SSH moved to $SSH_LISTEN_PORT)..."
+  REMOVED_COUNT="$(fw_remove_port_rules 22)"
+  if [[ "${REMOVED_COUNT}" -gt 0 ]]; then
+    log "✓ Removed ${REMOVED_COUNT} firewall rule(s) for port 22"
+  else
+    log "✓ No firewall rules found for port 22"
+  fi
+fi
+
+fw_restart_firewall
+
+echo; log "Firewall note:"
+log "- DC firewall enabled; we allow 8006 and ${SSH_LISTEN_PORT}."
+log "- sshd not listening on 22; set DC 'Input Policy' to DROP only after confirming rules."
+
+# ==============================
+# PART 5: FINALIZATION
+# ==============================
+
+echo; log "Step 5: Testing and restarting sshd..."; test_and_restart_sshd_or_restore
+print_summary
 exit 0
