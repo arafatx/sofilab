@@ -35,13 +35,14 @@ Usage: $SCRIPT_NAME <command> [alias]
 
 Commands:
   login <alias>       Connect to configured host using SSH alias
-  --version, -v       Show version information
+  install             Install sofilab command globally (requires sudo)
+  uninstall           Uninstall sofilab command (requires sudo)
+  --version, -V       Show version information
   --help, -h          Show this help message
 
 Examples:
   $SCRIPT_NAME login pmx
-  $SCRIPT_NAME login pmx-home
-  $SCRIPT_NAME login router
+  $SCRIPT_NAME install
 
 Configuration format in sofilab.conf:
   [alias1,alias2]
@@ -50,13 +51,7 @@ Configuration format in sofilab.conf:
   password="PASSWORD"
   port="SSH_PORT" (optional, default 22)
   keyfile="ssh/alias_key" (optional)
-
-Note: Script tries configured port first, falls back to port 22 if connection refused
-
-Authentication priority:
-  1. SSH key (if keyfile specified or ssh/<alias>_key exists)
-  2. Password (if specified)
-  3. Direct SSH (relies on SSH agent or default keys)
+  scripts="script1.sh,script2.sh" (optional)
 
 EOF
 }
@@ -107,6 +102,41 @@ get_server_config() {
     SERVER_PASSWORD="$password"
     SERVER_PORT="${port:-22}"
     SERVER_KEYFILE="$keyfile"
+}
+
+# Check if a port is open without authentication (won't trigger firewall rules)
+check_port_open() {
+    local host="$1"
+    local port="$2"
+    local timeout=3
+    
+    # Try using nc (netcat) if available
+    if command -v nc >/dev/null 2>&1; then
+        # Different nc versions have different syntax
+        if nc -h 2>&1 | grep -q "GNU netcat"; then
+            # GNU netcat
+            nc -z -w "$timeout" "$host" "$port" >/dev/null 2>&1
+        else
+            # BSD/macOS netcat
+            nc -z -w "$timeout" "$host" "$port" >/dev/null 2>&1
+        fi
+        return $?
+    fi
+    
+    # Fallback to bash's /dev/tcp if nc not available
+    if [[ -n "$BASH_VERSION" ]]; then
+        timeout "$timeout" bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null
+        return $?
+    fi
+    
+    # Last resort: use telnet if available
+    if command -v telnet >/dev/null 2>&1; then
+        (echo quit | timeout "$timeout" telnet "$host" "$port" 2>/dev/null | grep -q "Connected") 2>/dev/null
+        return $?
+    fi
+    
+    # If no tools available, return success to proceed with SSH attempt
+    return 0
 }
 
 # Test SSH connectivity quickly
@@ -165,7 +195,6 @@ ssh_login() {
     [[ -z "$SERVER_HOST" ]] && { error "Unknown alias: $alias"; exit 1; }
     
     info "Connecting to $SERVER_HOST as $SERVER_USER"
-    info "Using port $SERVER_PORT $([ "$SERVER_PORT" == "22" ] && echo "(default SSH port)" || echo "(custom SSH port)")"
     
     # Determine SSH key
     local keyfile=""
@@ -180,27 +209,43 @@ ssh_login() {
         [[ -f "$auto_key" ]] && { keyfile="$auto_key"; info "Using auto-detected SSH key: $keyfile"; }
     fi
     
-    # Try configured port first
-    if test_ssh_connection "$SERVER_PORT" "$keyfile"; then
+    # Determine which port to use by checking port availability first
+    local use_port=""
+    
+    # Check configured port first (without authentication to avoid firewall triggers)
+    info "Checking port availability on $SERVER_PORT..."
+    if check_port_open "$SERVER_HOST" "$SERVER_PORT"; then
+        info "Port $SERVER_PORT is open $([ "$SERVER_PORT" == "22" ] && echo "(default SSH port)" || echo "(custom SSH port)")"
+        use_port="$SERVER_PORT"
+    elif [[ "$SERVER_PORT" != "22" ]]; then
+        # Only try port 22 as fallback if configured port is different
+        info "Port $SERVER_PORT is not accessible, checking fallback port 22..."
+        if check_port_open "$SERVER_HOST" "22"; then
+            info "Port 22 is open (fallback to default SSH port)"
+            use_port="22"
+        else
+            error "Neither port $SERVER_PORT nor port 22 are accessible"
+            error "Please check your network connection and firewall settings"
+            exit 1
+        fi
+    else
+        error "Port $SERVER_PORT is not accessible"
+        error "Please check your network connection and firewall settings"
+        exit 1
+    fi
+    
+    # Now attempt SSH connection on the verified open port
+    info "Attempting SSH connection on port $use_port..."
+    if test_ssh_connection "$use_port" "$keyfile"; then
         info "Authentication successful"
-        connect_ssh "$SERVER_PORT" "$keyfile"
+        connect_ssh "$use_port" "$keyfile"
         info "Disconnected from $SERVER_HOST"
         return 0
+    else
+        error "Authentication failed on port $use_port"
+        error "Please check your credentials or SSH key"
+        exit 1
     fi
-    
-    # Fallback to port 22 if configured port != 22
-    if [[ "$SERVER_PORT" != "22" ]]; then
-        warn "Connection failed on port $SERVER_PORT, trying fallback port 22"
-        if test_ssh_connection "22" "$keyfile"; then
-            info "Authentication successful"
-            connect_ssh "22" "$keyfile"
-            info "Disconnected from $SERVER_HOST"
-            return 0
-        fi
-    fi
-    
-    error "Could not establish SSH connection on any port"
-    exit 1
 }
 
 # Show version information
@@ -214,12 +259,95 @@ show_version() {
     echo "Features: SSH connections, server monitoring, installation management"
 }
 
+# Install sofilab command globally
+install_sofilab() {
+    local install_dir="/usr/local/bin"
+    local install_name="sofilab"
+    local script_path="$SCRIPT_DIR/$SCRIPT_NAME"
+    local symlink_path="$install_dir/$install_name"
+    
+    info "Installing sofilab command globally..."
+    
+    # Check if script exists
+    if [[ ! -f "$script_path" ]]; then
+        error "Script not found: $script_path"
+        exit 1
+    fi
+    
+    # Make script executable
+    chmod +x "$script_path" || { error "Failed to make script executable"; exit 1; }
+    info "Made script executable: $script_path"
+    
+    # Check if /usr/local/bin exists, create if needed
+    if [[ ! -d "$install_dir" ]]; then
+        info "Creating $install_dir directory..."
+        sudo mkdir -p "$install_dir" || { error "Failed to create $install_dir"; exit 1; }
+    fi
+    
+    # Remove existing symlink if it exists
+    if [[ -L "$symlink_path" ]]; then
+        info "Removing existing symlink..."
+        sudo rm "$symlink_path" || { error "Failed to remove existing symlink"; exit 1; }
+    elif [[ -f "$symlink_path" ]]; then
+        error "File already exists at $symlink_path and is not a symlink"
+        error "Please remove it manually or choose a different installation method"
+        exit 1
+    fi
+    
+    # Create symlink
+    info "Creating symlink: $symlink_path -> $script_path"
+    sudo ln -s "$script_path" "$symlink_path" || { error "Failed to create symlink"; exit 1; }
+    
+    # Verify installation
+    if command -v "$install_name" >/dev/null 2>&1; then
+        info "✓ Installation successful!"
+        info "You can now use 'sofilab' command from anywhere"
+        info ""
+        info "Try: sofilab --help"
+    else
+        warn "Installation completed but 'sofilab' command not found in PATH"
+        warn "You may need to add $install_dir to your PATH"
+        warn "Add this line to your ~/.bashrc or ~/.zshrc:"
+        warn "  export PATH=\"$install_dir:\$PATH\""
+    fi
+}
+
+# Uninstall sofilab command
+uninstall_sofilab() {
+    local install_dir="/usr/local/bin"
+    local install_name="sofilab"
+    local symlink_path="$install_dir/$install_name"
+    
+    info "Uninstalling sofilab command..."
+    
+    if [[ -L "$symlink_path" ]]; then
+        # It's a symlink, safe to remove
+        sudo rm "$symlink_path" || { error "Failed to remove symlink"; exit 1; }
+        info "✓ Removed symlink: $symlink_path"
+        info "Uninstallation successful!"
+    elif [[ -f "$symlink_path" ]]; then
+        # It's a regular file, be cautious
+        error "Found regular file at $symlink_path (not a symlink)"
+        error "Please verify and remove manually if needed"
+        exit 1
+    else
+        warn "No installation found at $symlink_path"
+        info "Nothing to uninstall"
+    fi
+}
+
 # Main function
 main() {
     case "${1:-}" in
         login)
             [[ -z "${2:-}" ]] && { error "Alias required for login command"; usage; exit 1; }
             ssh_login "$2"
+            ;;
+        install)
+            install_sofilab
+            ;;
+        uninstall)
+            uninstall_sofilab
             ;;
         --version|-V|version)
             show_version
