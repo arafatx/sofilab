@@ -29,6 +29,7 @@ LOG_LEVEL="INFO"
 ENABLE_LOGGING="true"
 MAX_LOG_SIZE="10M"
 MAX_LOG_FILES=5
+SCRIPT_EXIT_ON_ERROR="true"  # Default to exit remote scripts on error for safety
 
 # Initialize log file variables (will be set by init_logging)
 MAIN_LOG=""
@@ -116,6 +117,13 @@ load_global_config() {
                         config_errors+=("Invalid max_log_files: $value (must be a positive number)")
                     fi
                     ;;
+                script_exit_on_error)
+                    if [[ "$value" =~ ^(true|false)$ ]]; then
+                        SCRIPT_EXIT_ON_ERROR="$value"
+                    else
+                        config_errors+=("Invalid script_exit_on_error: $value (must be true or false)")
+                    fi
+                    ;;
                 *)
                     # Unknown key in global section - just warn, don't fail
                     warn "Unknown global configuration key: $key"
@@ -143,7 +151,7 @@ validate_config_syntax() {
     local current_section=""
     local syntax_errors=()
     local valid_server_keys="host user password port keyfile scripts"
-    local valid_global_keys="log_dir log_level enable_logging max_log_size max_log_files"
+    local valid_global_keys="log_dir log_level enable_logging max_log_size max_log_files script_exit_on_error"
     
     while IFS= read -r line; do
         ((line_num++))
@@ -374,6 +382,7 @@ Configuration format in sofilab.conf:
   enable_logging="true"             # Enable/disable logging: true or false
   max_log_size="10M"               # Maximum log file size before rotation
   max_log_files="5"                # Number of rotated log files to keep
+  script_exit_on_error="true"      # Exit remote scripts on first error: true or false
 
   Server Configuration:
   [host-alias1,host-alias2]
@@ -838,7 +847,12 @@ execute_remote_script() {
     local env_vars="SSH_PORT='$SERVER_PORT' ACTUAL_PORT='$use_port' ADMIN_USER='$SERVER_USER' SSH_KEY_PATH='$ssh_key_path' SSH_PUBLIC_KEY='$ssh_public_key'"
     
     # Execute script remotely (using full path from home directory)
-    local ssh_cmd="cd ~ && chmod +x $remote_path && $env_vars bash $remote_path; rm -f $remote_path"
+    # Apply script_exit_on_error setting if enabled, store the exit code and clean up regardless of success/failure
+    local bash_opts=""
+    if [[ "$SCRIPT_EXIT_ON_ERROR" == "true" ]]; then
+        bash_opts="-e"  # Exit script on first error
+    fi
+    local ssh_cmd="cd ~ && chmod +x $remote_path && $env_vars bash $bash_opts $remote_path; script_exit_code=\$?; rm -f $remote_path; exit \$script_exit_code"
     
     local exec_success=false
     
@@ -853,26 +867,46 @@ execute_remote_script() {
     debug "Executing remote script: $script_file on $alias ($SERVER_HOST:$use_port)"
     log_message "INFO" "Starting remote script execution: $script_file on $alias ($SERVER_HOST:$use_port)"
     
+    # Use PIPESTATUS to capture the exit code of the SSH command, not the pipe
+    # We need to distinguish between authentication failures (255) and script execution failures (other non-zero codes)
+    local ssh_exit_code=0
+    local auth_attempted=false
+    
     if [[ -n "$keyfile" ]]; then
         # Try SSH key first
-        if ssh -i "$keyfile" -p "$use_port" -o StrictHostKeyChecking=accept-new -o PasswordAuthentication=no -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$ssh_cmd" 2>&1 | prefix_and_log_remote_output; then
+        ssh -i "$keyfile" -p "$use_port" -o StrictHostKeyChecking=accept-new -o PasswordAuthentication=no -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$ssh_cmd" 2>&1 | prefix_and_log_remote_output
+        ssh_exit_code=${PIPESTATUS[0]}
+        auth_attempted=true
+        
+        if [[ $ssh_exit_code -eq 0 ]]; then
             exec_success=true
-        elif [[ -n "$SERVER_PASSWORD" ]] && command -v sshpass >/dev/null 2>&1; then
-            # SSH key failed, add small delay to avoid triggering fail2ban
+        elif [[ $ssh_exit_code -eq 255 ]] && [[ -n "$SERVER_PASSWORD" ]] && command -v sshpass >/dev/null 2>&1; then
+            # SSH authentication failed (exit code 255), try password
             sleep 2
             progress "SSH key failed, using password authentication..."
-            if sshpass -p "$SERVER_PASSWORD" ssh -p "$use_port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$ssh_cmd" 2>&1 | prefix_and_log_remote_output; then
+            sshpass -p "$SERVER_PASSWORD" ssh -p "$use_port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$ssh_cmd" 2>&1 | prefix_and_log_remote_output
+            ssh_exit_code=${PIPESTATUS[0]}
+            if [[ $ssh_exit_code -eq 0 ]]; then
                 exec_success=true
             fi
+        elif [[ $ssh_exit_code -ne 255 ]]; then
+            # Script execution failed (not an auth failure)
+            exec_success=false
         fi
     elif [[ -n "$SERVER_PASSWORD" ]] && command -v sshpass >/dev/null 2>&1; then
         # No SSH key, use password directly
-        if sshpass -p "$SERVER_PASSWORD" ssh -p "$use_port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$ssh_cmd" 2>&1 | prefix_and_log_remote_output; then
+        sshpass -p "$SERVER_PASSWORD" ssh -p "$use_port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$ssh_cmd" 2>&1 | prefix_and_log_remote_output
+        ssh_exit_code=${PIPESTATUS[0]}
+        auth_attempted=true
+        if [[ $ssh_exit_code -eq 0 ]]; then
             exec_success=true
         fi
     else
         # Try without any authentication method (will prompt for password)
-        if ssh -p "$use_port" -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$ssh_cmd" 2>&1 | prefix_and_log_remote_output; then
+        ssh -p "$use_port" -o ConnectTimeout=5 "$SERVER_USER@$SERVER_HOST" "$ssh_cmd" 2>&1 | prefix_and_log_remote_output
+        ssh_exit_code=${PIPESTATUS[0]}
+        auth_attempted=true
+        if [[ $ssh_exit_code -eq 0 ]]; then
             exec_success=true
         fi
     fi
