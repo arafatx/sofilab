@@ -181,6 +181,12 @@ refresh_and_upgrade_system() {
   echo
 }
 
+install_extra_packages() {
+  log "Step 4: Install extra useful packages..."
+  apt-get install -y htop btop
+  echo
+}
+
 # =========================
 # Main
 # =========================
@@ -196,6 +202,7 @@ detect_debian_and_pve
 ensure_keyrings_present
 configure_repositories
 refresh_and_upgrade_system
+install_extra_packages
 
 log "=== Complete ==="
 log "Debian codename : $DEB_CODENAME"
