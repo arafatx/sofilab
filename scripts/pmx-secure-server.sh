@@ -132,12 +132,42 @@ EOF
 # ---------- FIREWALL (simple, using native Proxmox tools) ----------
 
 fw_enable_datacenter() {
-  # Enable datacenter firewall using pve-firewall command
+  # Enable datacenter firewall in configuration file first
+  local fw_file="/etc/pve/firewall/cluster.fw"
+  
+  # Ensure the config file exists with proper structure
+  if [[ ! -f "$fw_file" ]]; then
+    cat > "$fw_file" <<EOF
+[OPTIONS]
+enable: 1
+
+[RULES]
+EOF
+    log "✓ Created datacenter firewall configuration with enable: 1"
+  else
+    # Ensure enable: 1 is set in existing config
+    if grep -q "^enable: 0" "$fw_file" 2>/dev/null; then
+      sed -i 's/^enable: 0/enable: 1/' "$fw_file"
+      log "✓ Changed firewall enable from 0 to 1 in configuration"
+    elif ! grep -q "^enable:" "$fw_file" 2>/dev/null; then
+      # Add enable option if missing
+      if grep -q "^\[OPTIONS\]" "$fw_file"; then
+        sed -i "/^\[OPTIONS\]/a enable: 1" "$fw_file"
+      else
+        sed -i "1i [OPTIONS]\nenable: 1\n" "$fw_file"
+      fi
+      log "✓ Added enable: 1 to firewall configuration"
+    else
+      log "✓ Firewall already enabled in configuration (enable: 1)"
+    fi
+  fi
+  
+  # Now start the firewall service if needed
   if ! pve-firewall status 2>/dev/null | grep -q "Status: enabled"; then
     pve-firewall start >/dev/null 2>&1 || true
-    log "✓ Proxmox datacenter firewall enabled"
+    log "✓ Started Proxmox datacenter firewall service"
   else
-    log "✓ Proxmox datacenter firewall already enabled"
+    log "✓ Proxmox datacenter firewall service already running"
   fi
 }
 
@@ -156,21 +186,39 @@ EOF
     log "Created new datacenter firewall configuration"
   fi
   
+  # Ensure firewall is enabled in the config
+  if grep -q "^enable: 0" "$fw_file" 2>/dev/null; then
+    sed -i 's/^enable: 0/enable: 1/' "$fw_file"
+    log "✓ Enabled firewall in configuration"
+  elif ! grep -q "^enable:" "$fw_file" 2>/dev/null; then
+    # Add enable option if missing
+    if grep -q "^\[OPTIONS\]" "$fw_file"; then
+      sed -i "/^\[OPTIONS\]/a enable: 1" "$fw_file"
+    else
+      # Add OPTIONS section with enable
+      sed -i "1i [OPTIONS]\nenable: 1\n" "$fw_file"
+    fi
+    log "✓ Added enable option to firewall configuration"
+  fi
+  
   # Check if rule already exists (any action for this port)
-  if grep -q "^IN.*tcp.*dport ${dport}" "$fw_file" 2>/dev/null; then
+  if grep -q "^IN.*dport ${dport}" "$fw_file" 2>/dev/null; then
     log "✓ Firewall rule exists for port ${dport}"
     return 0
   fi
   
-  # Add the rule to the [RULES] section
+  # Add the rule to the [RULES] section with proper Proxmox format
+  # Proxmox firewall uses: IN ACCEPT -p tcp -dport 8006 # comment
+  local rule_line="IN ${action} -p tcp -dport ${dport} # ${comment}"
+  
   if grep -q "^\[RULES\]" "$fw_file"; then
     # Insert after [RULES] line
-    sed -i "/^\[RULES\]/a IN ${action} -p tcp -dport ${dport} -comment \"${comment}\"" "$fw_file"
+    sed -i "/^\[RULES\]/a ${rule_line}" "$fw_file"
   else
     # Add [RULES] section and the rule
     echo "" >> "$fw_file"
     echo "[RULES]" >> "$fw_file"
-    echo "IN ${action} -p tcp -dport ${dport} -comment \"${comment}\"" >> "$fw_file"
+    echo "${rule_line}" >> "$fw_file"
   fi
   
   log "✓ Added firewall ${action} rule for port ${dport} (${comment})"
@@ -182,8 +230,11 @@ fw_remove_port_rules() {
   local removed=0
   
   if [[ -f "$fw_file" ]]; then
-    # Count existing rules for this port
-    local count=$(grep -c "dport ${dport}" "$fw_file" 2>/dev/null || echo "0")
+    # Count existing rules for this port (handle grep exit code properly)
+    local count=0
+    if grep -q "dport ${dport}" "$fw_file" 2>/dev/null; then
+      count=$(grep -c "dport ${dport}" "$fw_file" 2>/dev/null)
+    fi
     
     if [[ "$count" -gt 0 ]]; then
       # Remove all rules for this port
@@ -203,7 +254,7 @@ fw_cleanup_duplicates() {
     return 0
   fi
   
-  log "Cleaning up duplicate firewall rules..."
+  log "Cleaning up duplicate and malformed firewall rules..."
   
   # Create a temporary file to store unique rules
   local temp_file=$(mktemp)
@@ -234,7 +285,25 @@ fw_cleanup_duplicates() {
       done
       
       if [[ "$already_seen" == false ]]; then
-        echo "$line" >> "$temp_file"
+        # Clean up malformed rules - remove sport and log parameters if present
+        local cleaned_line="$line"
+        
+        # Remove -sport parameter if it exists
+        if [[ "$cleaned_line" =~ -sport[[:space:]]+[0-9]+ ]]; then
+          cleaned_line=$(echo "$cleaned_line" | sed -E 's/-sport[[:space:]]+[0-9]+//g')
+          log "  ✓ Removed incorrect -sport parameter from port $port rule"
+        fi
+        
+        # Remove -log parameter if it exists
+        if [[ "$cleaned_line" =~ -log[[:space:]]+[a-z]+ ]]; then
+          cleaned_line=$(echo "$cleaned_line" | sed -E 's/-log[[:space:]]+[a-z]+//g')
+          log "  ✓ Removed incorrect -log parameter from port $port rule"
+        fi
+        
+        # Clean up extra spaces
+        cleaned_line=$(echo "$cleaned_line" | sed 's/  */ /g' | sed 's/[[:space:]]*$//')
+        
+        echo "$cleaned_line" >> "$temp_file"
         seen_ports+=("$port")
       else
         log "  ✓ Removed duplicate rule for port $port"
@@ -244,8 +313,12 @@ fw_cleanup_duplicates() {
     fi
   done < "$fw_file"
   
-  # Replace the original file with the cleaned version
-  mv "$temp_file" "$fw_file"
+  # Replace the original file with the cleaned version (handle Proxmox permissions)
+  cat "$temp_file" > "$fw_file" 2>/dev/null || {
+    cp "$temp_file" "$fw_file.tmp"
+    mv "$fw_file.tmp" "$fw_file"
+  }
+  rm -f "$temp_file"
 }
 
 fw_restart_firewall() {
@@ -417,7 +490,7 @@ echo; log "Step 4: Configuring Proxmox firewall (Datacenter scope)..."
 fw_enable_datacenter
 fw_cleanup_duplicates
 fw_ensure_rule_exists "8006" "Proxmox-WebUI"
-fw_ensure_rule_exists "$SSH_LISTEN_PORT" "SSH-Allowed"
+fw_ensure_rule_exists "$SSH_LISTEN_PORT" "SSH-Custom-Port"
 
 if [[ "$SSH_LISTEN_PORT" != "22" ]]; then
   log "Removing any rules for port 22 (since SSH moved to $SSH_LISTEN_PORT)..."
